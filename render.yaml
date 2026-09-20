@@ -1,9 +1,8 @@
 services:
   - type: web
     name: meesho-poster-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: python bot.py
+    runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     healthCheckPath: /health
     envVars:
@@ -21,3 +20,4 @@ services:
         value: viralbots
       - key: DEAL_CHANNEL_ID
         sync: false
+

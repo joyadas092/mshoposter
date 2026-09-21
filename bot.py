@@ -125,11 +125,27 @@ last_sent_deals: dict[int, dict] = {}
 
 def extract_custom_price(text: str) -> int | None:
     """Extract a user-supplied price digit from message text outside the URL."""
-    text_no_url = MEESHO_RE.sub("", text)
-    m = re.search(r"(?:@|price[:\s]*|rs\.?\s*|inr\s*|₹\s*)(\d+)", text_no_url, re.IGNORECASE)
+    # 1. Remove URLs
+    cleaned = MEESHO_RE.sub("", text)
+
+    # 2. Filter out discount percentages (e.g. "25% OFF", "25%")
+    cleaned = re.sub(r"\b\d+\s*%\s*(?:off)?\b", "", cleaned, flags=re.IGNORECASE)
+
+    # 3. Filter out time durations (e.g. "3 hours", "24 hrs")
+    cleaned = re.sub(r"\b\d+\s*(?:hours?|hrs?|days?|mins?|minutes?|am|pm)\b", "", cleaned, flags=re.IGNORECASE)
+
+    # 4. Remove standard Meesho app share promotional boilerplate
+    cleaned = re.sub(r"Hey,\s*check out this product on Meesho!?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"Get (?:upto|up to)[^!\n]*!?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"Also grab extra[^!\n]*!?", "", cleaned, flags=re.IGNORECASE)
+
+    # 5. Look for explicit price tags: @75, price: 75, price 75, rs 75, rs.75, ₹75, 75/-
+    m = re.search(r"(?:@|price[:\s]*|rs\.?\s*|inr\s*|₹\s*)(\d{1,6})\b", cleaned, re.IGNORECASE)
     if m:
         return int(m.group(1))
-    numbers = re.findall(r"\b\d{1,6}\b", text_no_url)
+
+    # 6. Standalone number provided by user
+    numbers = re.findall(r"\b\d{1,6}\b", cleaned)
     if numbers:
         return int(numbers[0])
     return None
@@ -547,15 +563,13 @@ def build_caption(info: dict, original_url: str) -> str:
     if len(name) > 100:
         name = name[:97].rstrip() + "..."
 
-    price = info["price"]
-    mrp   = info["mrp"]
+    price = info.get("price")
 
     lines = [f"**{name}**\n"]
 
     if price:
         lines.append(f"Price: @{price}")
 
-    lines.append("Get additional Discount in Mobile App")
     lines.append("")
     link = info.get("url") or original_url
     lines.append(link)

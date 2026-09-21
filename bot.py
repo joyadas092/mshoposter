@@ -116,6 +116,12 @@ screenshot_mode: dict[int, bool] = {}
 # Pending custom prices sent prior to link {chat_id: (price, timestamp)}
 pending_prices: dict[int, tuple[int, float]] = {}
 
+# Active futures waiting for incoming price messages while link fetches {chat_id: asyncio.Future}
+active_deal_waiters: dict[int, asyncio.Future] = {}
+
+# Recently sent deals per chat {chat_id: {"user_msg_id": int, "channel_msg_id": int, "info": dict, "url": str, "timestamp": float}}
+last_sent_deals: dict[int, dict] = {}
+
 
 def extract_custom_price(text: str) -> int | None:
     """Extract a user-supplied price digit from message text outside the URL."""
@@ -810,10 +816,55 @@ async def on_message(client, message: Message):
 
     m = MEESHO_RE.search(text)
     if not m:
-        # Check if admin sent a standalone custom price (e.g., "75", "@75", "price 75")
+        # Check if admin sent just a price number (e.g., "75", "@75", "price 75")
         pure_price = re.fullmatch(r"[@₹]?\s*(?:price[:\s]*)?(\d{1,6})\s*(?:/-)?", text.strip(), re.I)
         if pure_price:
             p_val = int(pure_price.group(1))
+
+            # 1. If an active deal is fetching right now, deliver the price to it immediately!
+            waiter = active_deal_waiters.get(message.chat.id)
+            if waiter and not waiter.done():
+                waiter.set_result(p_val)
+                await message.reply(f"💰 Applied price: **@{p_val}**")
+                return
+
+            # 2. If a deal was just posted in the last 120s (or user replied to it), edit the post!
+            target_deal = None
+            if message.reply_to_message:
+                ld = last_sent_deals.get(message.chat.id)
+                if ld and ld.get("user_msg_id") == message.reply_to_message.id:
+                    target_deal = ld
+            if not target_deal:
+                ld = last_sent_deals.get(message.chat.id)
+                if ld and (time.time() - ld.get("timestamp", 0)) < 120:
+                    target_deal = ld
+
+            if target_deal:
+                target_deal["info"]["price"] = p_val
+                new_caption = build_caption(target_deal["info"], target_deal["url"])
+                try:
+                    await client.edit_message_caption(
+                        chat_id=message.chat.id,
+                        message_id=target_deal["user_msg_id"],
+                        caption=new_caption,
+                    )
+                except Exception as e:
+                    log.warning("Failed to edit user message caption: %s", e)
+
+                if target_deal.get("channel_msg_id"):
+                    try:
+                        await client.edit_message_caption(
+                            chat_id=DEAL_CHANNEL_ID,
+                            message_id=target_deal["channel_msg_id"],
+                            caption=new_caption,
+                        )
+                    except Exception as e:
+                        log.warning("Failed to edit channel message caption: %s", e)
+
+                await message.reply(f"✏️ Updated post price to: **@{p_val}**")
+                return
+
+            # 3. Otherwise, save as pending for the upcoming link
             pending_prices[message.chat.id] = (p_val, time.time())
             await message.reply(f"💰 Custom price set: **@{p_val}**\nSend the Meesho link next to apply it.")
         return
@@ -825,10 +876,15 @@ async def on_message(client, message: Message):
     if custom_price is None and message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
         custom_price = extract_custom_price(message.reply_to_message.text or message.reply_to_message.caption or "")
     if custom_price is None:
-        pending = pending_prices.get(message.chat.id)
+        pending = pending_prices.pop(message.chat.id, None)
         if pending and (time.time() - pending[1]) < 300:
             custom_price = pending[0]
-            pending_prices.pop(message.chat.id, None)
+
+    # If no price yet, set up an active waiter so if a separate price message arrives in the next ~3.5s, we catch it!
+    waiter = None
+    if custom_price is None:
+        waiter = _loop.create_future()
+        active_deal_waiters[message.chat.id] = waiter
 
     use_screenshot = screenshot_mode.get(message.chat.id, False)
 
@@ -841,7 +897,24 @@ async def on_message(client, message: Message):
 
     tmp: Path | None = None
     try:
-        html = await asyncio.to_thread(fetch_html, url)
+        fetch_task = asyncio.create_task(asyncio.to_thread(fetch_html, url))
+
+        # Wait briefly for follow-up price message if user sent link first and price right after
+        if waiter is not None:
+            try:
+                done, _ = await asyncio.wait(
+                    [waiter, fetch_task],
+                    timeout=3.5,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if waiter.done():
+                    custom_price = waiter.result()
+            except Exception:
+                pass
+            finally:
+                active_deal_waiters.pop(message.chat.id, None)
+
+        html = await fetch_task
         info = parse_product(html)
         if custom_price is not None:
             info["price"] = custom_price
@@ -901,9 +974,10 @@ async def on_message(client, message: Message):
                 sent_message = await message.reply(caption)
 
         # ── Auto-post to deal channel ────────────────────────────────────────
+        channel_message = None
         if sent_message is not None:
             try:
-                await client.copy_message(
+                channel_message = await client.copy_message(
                     chat_id=DEAL_CHANNEL_ID,
                     from_chat_id=sent_message.chat.id,
                     message_id=sent_message.id,
@@ -912,10 +986,20 @@ async def on_message(client, message: Message):
             except Exception as e:
                 log.warning("Failed to post to deal channel: %s", e)
 
+            # Record last sent deal so a late price message can edit it
+            last_sent_deals[message.chat.id] = {
+                "user_msg_id": sent_message.id,
+                "channel_msg_id": channel_message.id if channel_message else None,
+                "info": dict(info),
+                "url": url,
+                "timestamp": time.time(),
+            }
+
         try:
             await status.delete()
         except Exception:
             pass
+
 
     except Exception as e:
         log.exception("Failed to process: %s", url)

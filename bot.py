@@ -528,21 +528,19 @@ def build_caption(info: dict, original_url: str) -> str:
 
     price = info["price"]
     mrp   = info["mrp"]
-    disc  = info["discount"]
 
     lines = [f"**{name}**\n"]
 
     if price:
         if mrp and mrp > price:
             lines.append(f"Price: ~~Rs.{mrp}~~ ❌ → **Rs.{price}**")
-            if disc:
-                lines.append(f"You Save: **{disc}% OFF** 🔥")
         else:
             lines.append(f"Price: **Rs.{price}**")
 
+    lines.append("Get additional Discount in Mobile App")
     lines.append("")
     link = info.get("url") or original_url
-    lines.append(f"🛒 Buy on Meesho: {link}")
+    lines.append(link)
 
     return "\n".join(lines)
 

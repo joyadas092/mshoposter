@@ -113,6 +113,21 @@ FETCH_HEADERS = {
 # Per-chat screenshot mode toggle {chat_id: bool}
 screenshot_mode: dict[int, bool] = {}
 
+# Pending custom prices sent prior to link {chat_id: (price, timestamp)}
+pending_prices: dict[int, tuple[int, float]] = {}
+
+
+def extract_custom_price(text: str) -> int | None:
+    """Extract a user-supplied price digit from message text outside the URL."""
+    text_no_url = MEESHO_RE.sub("", text)
+    m = re.search(r"(?:@|price[:\s]*|rs\.?\s*|inr\s*|₹\s*)(\d+)", text_no_url, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    numbers = re.findall(r"\b\d{1,6}\b", text_no_url)
+    if numbers:
+        return int(numbers[0])
+    return None
+
 
 # ── DB / user management (bot-key aware, like Amazon Pricehist) ─────────────
 
@@ -532,10 +547,7 @@ def build_caption(info: dict, original_url: str) -> str:
     lines = [f"**{name}**\n"]
 
     if price:
-        if mrp and mrp > price:
-            lines.append(f"Price: ~~Rs.{mrp}~~ ❌ → **Rs.{price}**")
-        else:
-            lines.append(f"Price: **Rs.{price}**")
+        lines.append(f"Price: @{price}")
 
     lines.append("Get additional Discount in Mobile App")
     lines.append("")
@@ -798,9 +810,26 @@ async def on_message(client, message: Message):
 
     m = MEESHO_RE.search(text)
     if not m:
+        # Check if admin sent a standalone custom price (e.g., "75", "@75", "price 75")
+        pure_price = re.fullmatch(r"[@₹]?\s*(?:price[:\s]*)?(\d{1,6})\s*(?:/-)?", text.strip(), re.I)
+        if pure_price:
+            p_val = int(pure_price.group(1))
+            pending_prices[message.chat.id] = (p_val, time.time())
+            await message.reply(f"💰 Custom price set: **@{p_val}**\nSend the Meesho link next to apply it.")
         return
 
     url = clean_url(m.group(0))
+
+    # Check for custom price: in this message, in replied message, or previously set
+    custom_price = extract_custom_price(text)
+    if custom_price is None and message.reply_to_message and (message.reply_to_message.text or message.reply_to_message.caption):
+        custom_price = extract_custom_price(message.reply_to_message.text or message.reply_to_message.caption or "")
+    if custom_price is None:
+        pending = pending_prices.get(message.chat.id)
+        if pending and (time.time() - pending[1]) < 300:
+            custom_price = pending[0]
+            pending_prices.pop(message.chat.id, None)
+
     use_screenshot = screenshot_mode.get(message.chat.id, False)
 
     status_text = (
@@ -814,6 +843,8 @@ async def on_message(client, message: Message):
     try:
         html = await asyncio.to_thread(fetch_html, url)
         info = parse_product(html)
+        if custom_price is not None:
+            info["price"] = custom_price
 
         log.info(
             "Product: %s | Rs.%s (MRP Rs.%s, %s%% off) | %d images | screenshot=%s",
